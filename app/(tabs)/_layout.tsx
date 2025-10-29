@@ -13,28 +13,34 @@ import Animated, {
 
 // Pre-define styles for better performance
 const containerStyle = {
-  backgroundColor: '#000000',
-  paddingTop: 12,
-  paddingBottom: 28,
-  paddingHorizontal: 10,
-  height: 90,
+  backgroundColor:  '#1C1C1E', // Dark background like in the image
+  paddingTop: 16,
+  paddingBottom: 16,
+  paddingHorizontal: 16,
+  height: 80,
   position: 'absolute' as const,
-  bottom: 0,
-  left: 0,
-  right: 0,
+  bottom: 16, // Add margin from bottom
+  left: 16,
+  right: 16,
   flexDirection: 'row' as const,
   justifyContent: 'space-around' as const,
   alignItems: 'center' as const,
+  borderRadius: 30, // Large border radius like in the image
+  shadowColor: '#000',
+  shadowOffset: { width: 0, height: 4 },
+  shadowOpacity: 0.3,
+  shadowRadius: 8,
+  elevation: 10,
 };
 
 const ovalStyle = {
   position: 'absolute' as const,
-  backgroundColor: '#2466f3ff',
+  backgroundColor: '#5A7BFF', // Lighter blue for active state
   borderRadius: 22,
   width: 80,
   height: 50,
-  top: 12.5,
-  left: 10,
+  top: 16,
+  left: 16,
 };
 
 // Memoized styles for tab items
@@ -57,8 +63,8 @@ const tabItemInnerStyle = {
 
 const tabLabelStyle = {
   color: 'white',
-  marginLeft: 5,
-  fontSize: 11,
+  marginLeft: 6,
+  fontSize: 12,
   fontWeight: '600' as const,
 };
 
@@ -74,7 +80,7 @@ const CustomTabBar = React.memo(({ state, descriptors, navigation }: any) => {
   const { screenWidth, ovalWidth, tabSpacing, startOffset } = useMemo(() => {
     const width = Dimensions.get('window').width;
     const oval = 80;
-    const containerPadding = 20; // Total horizontal padding (10px each side)
+    const containerPadding = 64; // Updated: 32px margin on each side (16px container margin + 16px padding)
     const availableWidth = width - containerPadding;
     const spacing = availableWidth / 3; // Space for each tab
     const offset = (spacing - oval) / 2; // Offset để oval center trong tab
@@ -146,8 +152,8 @@ const CustomTabBar = React.memo(({ state, descriptors, navigation }: any) => {
             >
               <Ionicons
                 name={isFocused ? tab.icon as any : tab.iconOutline as any}
-                size={20}
-                color={isFocused ? 'white' : '#AAA'}
+                size={24}
+                color={isFocused ? 'white' : 'rgba(255, 255, 255, 0.6)'}
               />
               {isFocused && (
                 <Text

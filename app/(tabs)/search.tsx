@@ -114,6 +114,13 @@ export default function SearchTab() {
   const [gameDLCs, setGameDLCs] = useState<DLCResult[]>([]);
   const [modalVisible, setModalVisible] = useState(false);
   const [loadingDetail, setLoadingDetail] = useState(false);
+  
+  // Navigation history for back button
+  const [navigationHistory, setNavigationHistory] = useState<Array<{
+    game: SearchResult;
+    detail: GameDetail | null;
+    dlcs: DLCResult[];
+  }>>([]);
 
   const fetchSteamPrice = async (steamAppID: string) => {
     try {
@@ -282,6 +289,9 @@ export default function SearchTab() {
 
   // Handle game selection
   const handleGamePress = async (game: SearchResult) => {
+    // Clear navigation history when opening a new game
+    setNavigationHistory([]);
+    
     setSelectedGame(game);
     setModalVisible(true);
     setLoadingDetail(true);
@@ -300,6 +310,70 @@ export default function SearchTab() {
     }
     
     setLoadingDetail(false);
+  };
+
+  // Handle DLC selection
+  const handleDLCPress = async (dlc: DLCResult) => {
+    if (!dlc.steamAppID) {
+      Alert.alert('Thông báo', 'DLC này chưa có thông tin chi tiết');
+      return;
+    }
+
+    // Save current state to history before navigating to DLC
+    if (selectedGame && gameDetail !== null) {
+      setNavigationHistory(prev => [...prev, {
+        game: selectedGame,
+        detail: gameDetail,
+        dlcs: gameDLCs
+      }]);
+    }
+
+    // Create a SearchResult object from DLC
+    const dlcAsGame: SearchResult = {
+      dealID: dlc.dealID,
+      title: dlc.title,
+      normalPrice: dlc.normalPrice,
+      salePrice: dlc.salePrice,
+      savings: dlc.savings,
+      thumb: dlc.thumb,
+      storeID: '1',
+      steamAppID: dlc.steamAppID,
+      isDLC: true,
+      isBundle: false,
+      type: 'DLC',
+      steamPriceVN: dlc.steamPriceVN || undefined
+    };
+
+    // Update current modal with DLC details (no close/reopen)
+    setSelectedGame(dlcAsGame);
+    setLoadingDetail(true);
+    setGameDetail(null);
+    setGameDLCs([]); // Clear DLCs list when viewing a DLC
+
+    // Fetch DLC details
+    if (dlc.steamAppID) {
+      const detail = await fetchGameDetail(dlc.steamAppID);
+      setGameDetail(detail);
+    }
+    
+    setLoadingDetail(false);
+  };
+
+  // Handle back button - navigate back in history or close modal
+  const handleBackPress = () => {
+    if (navigationHistory.length > 0) {
+      // Navigate back to previous game/DLC
+      const previous = navigationHistory[navigationHistory.length - 1];
+      setNavigationHistory(prev => prev.slice(0, -1));
+      
+      setSelectedGame(previous.game);
+      setGameDetail(previous.detail);
+      setGameDLCs(previous.dlcs);
+    } else {
+      // No history, close modal
+      setModalVisible(false);
+      setNavigationHistory([]);
+    }
   };
 
   // Fetch games and DLCs on sale
@@ -988,7 +1062,7 @@ export default function SearchTab() {
         visible={modalVisible}
         animationType="slide"
         presentationStyle="pageSheet"
-        onRequestClose={() => setModalVisible(false)}
+        onRequestClose={handleBackPress}
       >
         <View style={{ flex: 1, backgroundColor: '#2C2C2E' }}>
           {/* Header */}
@@ -1001,14 +1075,14 @@ export default function SearchTab() {
             backgroundColor: '#1C1C1E',
           }}>
             <TouchableOpacity
-              onPress={() => setModalVisible(false)}
+              onPress={handleBackPress}
               style={{
                 padding: 8,
                 marginRight: 12,
               }}
             >
               <Text style={{ color: '#A259FF', fontSize: 16, fontWeight: 'bold' }}>
-                ← Đóng
+                {navigationHistory.length > 0 ? '← Quay lại' : '← Đóng'}
               </Text>
             </TouchableOpacity>
             <Text style={{
@@ -1316,6 +1390,7 @@ export default function SearchTab() {
                       {gameDLCs.map((dlc) => (
                         <TouchableOpacity
                           key={dlc.dealID}
+                          onPress={() => handleDLCPress(dlc)}
                           style={{
                             backgroundColor: '#3C3C3E',
                             borderRadius: 12,

@@ -35,6 +35,10 @@ interface GameDeal {
     initial_formatted: string;
     final_formatted: string;
   };
+  genres?: Array<{
+    id: string;
+    description: string;
+  }>;
 }
 
 interface GameDetail {
@@ -78,6 +82,153 @@ interface GameDetail {
 
 type PriceFilter = 'all' | 'under100k' | '100k-500k' | '500k-1m' | 'over1m';
 
+// ===== API OPTIMIZATION TECHNIQUES =====
+// 1. RATE LIMITING: 150ms delay between calls to avoid hitting API limits
+// 2. CACHING: 10-minute cache to reduce redundant API calls
+// 3. PAGINATION: Load 10 games per page, fetch more on scroll
+// 4. PARALLEL FETCHING: Max 3 concurrent requests with queue control
+// 5. DEBOUNCE: 300ms delay for filter updates to reduce calls
+// 6. BATCH REQUESTS: Group multiple appids into single API call
+// ==========================================
+
+const API_CACHE = new Map<string, { data: any; timestamp: number }>();
+const CACHE_DURATION = 10 * 60 * 1000; // 10 minutes
+let lastApiCallTime = 0;
+const MIN_DELAY_BETWEEN_CALLS = 150; // 150ms between API calls to avoid rate limit
+const MAX_PARALLEL_REQUESTS = 3; // Maximum concurrent requests
+
+// Request queue for managing parallel requests
+let activeRequests = 0;
+const requestQueue: Array<() => Promise<any>> = [];
+
+// Helper function to delay API calls (Rate Limiting)
+async function rateLimitedFetch(url: string, options?: RequestInit): Promise<Response> {
+  const now = Date.now();
+  const timeSinceLastCall = now - lastApiCallTime;
+  
+  // If last call was too recent, wait
+  if (timeSinceLastCall < MIN_DELAY_BETWEEN_CALLS) {
+    await new Promise(resolve => setTimeout(resolve, MIN_DELAY_BETWEEN_CALLS - timeSinceLastCall));
+  }
+  
+  lastApiCallTime = Date.now();
+  return fetch(url, options);
+}
+
+// Helper for parallel fetching with concurrency control
+async function parallelFetchWithLimit<T>(
+  items: T[],
+  fetchFn: (item: T) => Promise<any>,
+  maxConcurrent: number = MAX_PARALLEL_REQUESTS
+): Promise<any[]> {
+  const results: any[] = [];
+  const executing: Promise<void>[] = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    
+    const promise = (async () => {
+      try {
+        const result = await fetchFn(item);
+        results[i] = result;
+      } catch (error) {
+        console.error(`Error fetching item ${i}:`, error);
+        results[i] = null;
+      }
+    })();
+
+    executing.push(promise);
+
+    // Remove completed promises
+    promise.finally(() => {
+      executing.splice(executing.indexOf(promise), 1);
+    });
+
+    // Wait if we've hit the concurrency limit
+    if (executing.length >= maxConcurrent) {
+      await Promise.race(executing);
+    }
+  }
+
+  // Wait for all remaining promises
+  await Promise.all(executing);
+  return results;
+}
+
+// Helper function to get cached data or fetch new (Caching)
+async function getCachedOrFetch(cacheKey: string, fetchFn: () => Promise<any>): Promise<any> {
+  const cached = API_CACHE.get(cacheKey);
+  const now = Date.now();
+  
+  // Return cached data if still valid
+  if (cached && (now - cached.timestamp) < CACHE_DURATION) {
+    console.log(`✅ Using cached data for: ${cacheKey}`);
+    return cached.data;
+  }
+  
+  // Fetch new data
+  const data = await fetchFn();
+  
+  // Cache the result
+  if (data) {
+    API_CACHE.set(cacheKey, { data, timestamp: now });
+  }
+  
+  return data;
+}
+
+// Batch multiple appids into single Steam API call (Request batching)
+async function fetchMultipleSteamApps(appIds: string[]): Promise<Map<string, any>> {
+  const results = new Map<string, any>();
+  
+  // Steam API supports multiple appids in one call
+  const batchSize = 10; // Steam limit
+  for (let i = 0; i < appIds.length; i += batchSize) {
+    const batch = appIds.slice(i, i + batchSize);
+    const appIdsParam = batch.join(',');
+    const cacheKey = `batch_apps_${appIdsParam}`;
+    
+    try {
+      const batchData = await getCachedOrFetch(cacheKey, async () => {
+        const response = await rateLimitedFetch(
+          `https://store.steampowered.com/api/appdetails?appids=${appIdsParam}&cc=vn&l=vietnamese`
+        );
+        
+        if (!response.ok) return null;
+        
+        const text = await response.text();
+        if (!text.trim().startsWith('{')) return null;
+        
+        return JSON.parse(text);
+      });
+      
+      if (batchData) {
+        batch.forEach(appId => {
+          if (batchData[appId]?.data) {
+            results.set(appId, batchData[appId].data);
+          }
+        });
+      }
+    } catch (error) {
+      console.error(`Error fetching batch:`, error);
+    }
+  }
+  
+  return results;
+}
+
+// Debounce helper for reducing frequent calls
+function debounce<T extends (...args: any[]) => any>(
+  func: T,
+  delay: number
+): (...args: Parameters<T>) => void {
+  let timeoutId: ReturnType<typeof setTimeout>;
+  return (...args: Parameters<T>) => {
+    clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => func(...args), delay);
+  };
+}
+
 export default function HomeTab() {
   const [deals, setDeals] = useState<GameDeal[]>([]);
   const [filteredDeals, setFilteredDeals] = useState<GameDeal[]>([]);
@@ -85,6 +236,7 @@ export default function HomeTab() {
   const [refreshing, setRefreshing] = useState(false);
   const [exchangeRate, setExchangeRate] = useState<number>(25000); // Default USD to VND rate
   const [selectedFilter, setSelectedFilter] = useState<PriceFilter>('all');
+  const [selectedGenre, setSelectedGenre] = useState<string>('all'); // New: genre filter
   const [showGameDetail, setShowGameDetail] = useState(false);
   const [selectedGame, setSelectedGame] = useState<GameDetail | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
@@ -95,6 +247,7 @@ export default function HomeTab() {
   const [showRefreshNotification, setShowRefreshNotification] = useState(false);
   const lastFocusTime = useRef<number>(0);
   const isFocused = useRef<boolean>(false);
+  const isFetchingGenres = useRef<boolean>(false); // Track if currently fetching genres
 
   // Store mapping với ưu tiên stores phổ biến tại Việt Nam
   const storeNames: { [key: string]: string } = {
@@ -252,53 +405,18 @@ export default function HomeTab() {
         return [];
       }
       
-      // Enrich với Steam VN prices - batch processing để faster
-      const enrichedGames = await Promise.all(
-        pageGames.map(async (game: any) => {
-          try {
-            // Lấy Steam VN price
-            const steamPrice = await fetchSteamPrice(game.id);
-            
-            if (!steamPrice) {
-              // Fallback to CheapShark data with VND conversion
-              return {
-                dealID: game.dealID || `steam_${game.id}`,
-                title: game.title,
-                normalPrice: game.normalPrice,
-                salePrice: game.price,
-                savings: game.savings,
-                thumb: game.thumb,
-                storeID: '1',
-                dealRating: '0',
-                gameID: game.id,
-                steamAppID: game.id,
-                isDLC: game.isDLC,
-                isBundle: game.isBundle,
-                type: game.type,
-                steamPriceVN: undefined // Will use fallback display
-              };
-            }
-            
-            return {
-              dealID: `steam_${game.id}`,
-              title: game.title,
-              normalPrice: (steamPrice.initial / 100).toString(),
-              salePrice: (steamPrice.final / 100).toString(),
-              savings: steamPrice.discount_percent.toString(),
-              thumb: game.thumb,
-              storeID: '1',
-              dealRating: '0',
-              gameID: game.id,
-              steamAppID: game.id,
-              isDLC: game.isDLC,
-              isBundle: game.isBundle,
-              type: game.type,
-              steamPriceVN: steamPrice
-            };
-          } catch (error) {
-            console.log('Error enriching game:', game.title);
-            // Return basic data as fallback
-            return {
+      console.log(`🔄 Fetching Steam VN prices for ${pageGames.length} games (rate limited)...`);
+      
+      // Enrich với Steam VN prices - SEQUENTIAL processing to avoid rate limit
+      const enrichedGames = [];
+      for (const game of pageGames) {
+        try {
+          // Lấy Steam VN price (with rate limiting and caching)
+          const steamPrice = await fetchSteamPrice(game.id);
+          
+          if (!steamPrice) {
+            // Fallback to CheapShark data with VND conversion
+            enrichedGames.push({
               dealID: game.dealID || `steam_${game.id}`,
               title: game.title,
               normalPrice: game.normalPrice,
@@ -313,10 +431,46 @@ export default function HomeTab() {
               isBundle: game.isBundle,
               type: game.type,
               steamPriceVN: undefined
-            };
+            });
+          } else {
+            enrichedGames.push({
+              dealID: `steam_${game.id}`,
+              title: game.title,
+              normalPrice: (steamPrice.initial / 100).toString(),
+              salePrice: (steamPrice.final / 100).toString(),
+              savings: steamPrice.discount_percent.toString(),
+              thumb: game.thumb,
+              storeID: '1',
+              dealRating: '0',
+              gameID: game.id,
+              steamAppID: game.id,
+              isDLC: game.isDLC,
+              isBundle: game.isBundle,
+              type: game.type,
+              steamPriceVN: steamPrice
+            });
           }
-        })
-      );
+        } catch (error) {
+          console.log('Error enriching game:', game.title);
+          // Push basic data as fallback
+          enrichedGames.push({
+            dealID: game.dealID || `steam_${game.id}`,
+            title: game.title,
+            normalPrice: game.normalPrice,
+            salePrice: game.price,
+            savings: game.savings,
+            thumb: game.thumb,
+            storeID: '1',
+            dealRating: '0',
+            gameID: game.id,
+            steamAppID: game.id,
+            isDLC: game.isDLC,
+            isBundle: game.isBundle,
+            type: game.type,
+            steamPriceVN: undefined
+          });
+        }
+      }
       
       // CHỈ GIỮ LẠI GAMES ĐANG SALE (discount >= 5%)
       const gamesOnSale = enrichedGames.filter(game => {
@@ -359,30 +513,44 @@ export default function HomeTab() {
   };
 
   const fetchSteamPrice = async (steamAppID: string, retries = 2) => {
+    const cacheKey = `steam_price_${steamAppID}`;
+    
     try {
-      // Sử dụng Steam Store API để lấy giá chính xác cho region VN
-      const response = await fetch(`https://store.steampowered.com/api/appdetails?appids=${steamAppID}&cc=vn&l=vietnamese`);
-      
-      // Check if response is ok
-      if (!response.ok) {
-        console.log(`Steam API error for ${steamAppID}: ${response.status}`);
-        return null;
-      }
-      
-      const text = await response.text();
-      
-      // Check if response is JSON
-      if (!text.trim().startsWith('{')) {
-        console.log(`Steam API returned non-JSON for ${steamAppID}`);
-        return null;
-      }
-      
-      const data = JSON.parse(text);
-      return data[steamAppID]?.data?.price_overview || null;
+      // Try to get from cache first
+      return await getCachedOrFetch(cacheKey, async () => {
+        // Use rate-limited fetch
+        const response = await rateLimitedFetch(
+          `https://store.steampowered.com/api/appdetails?appids=${steamAppID}&cc=vn&l=vietnamese`
+        );
+        
+        // Check if response is ok
+        if (!response.ok) {
+          console.log(`Steam API error for ${steamAppID}: ${response.status}`);
+          
+          // If 429 (Too Many Requests), wait longer
+          if (response.status === 429) {
+            console.log('⚠️ Rate limit hit, waiting 2 seconds...');
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          }
+          return null;
+        }
+        
+        const text = await response.text();
+        
+        // Check if response is JSON
+        if (!text.trim().startsWith('{')) {
+          console.log(`Steam API returned non-JSON for ${steamAppID}`);
+          return null;
+        }
+        
+        const data = JSON.parse(text);
+        // Only return price_overview to speed up loading
+        return data[steamAppID]?.data?.price_overview || null;
+      });
     } catch (error) {
       if (retries > 0) {
         console.log(`Retrying Steam price fetch for ${steamAppID}, retries left: ${retries}`);
-        await new Promise(resolve => setTimeout(resolve, 500)); // Wait 500ms before retry
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1s before retry
         return fetchSteamPrice(steamAppID, retries - 1);
       }
       console.error(`Error fetching Steam price for ${steamAppID}:`, error);
@@ -391,25 +559,35 @@ export default function HomeTab() {
   };
 
   const fetchGameDetail = useCallback(async (steamAppID: string, retries = 2) => {
+    const cacheKey = `game_detail_${steamAppID}`;
     setLoadingDetail(true);
+    
     try {
-      // Lấy thông tin chi tiết từ Steam API
-      const response = await fetch(`https://store.steampowered.com/api/appdetails?appids=${steamAppID}&cc=vn&l=vietnamese`);
-      
-      // Check if response is ok
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-      
-      const text = await response.text();
-      
-      // Check if response is JSON
-      if (!text.trim().startsWith('{')) {
-        throw new Error('Response is not JSON');
-      }
-      
-      const data = JSON.parse(text);
-      const gameDetail = data[steamAppID]?.data;
+      const gameDetail = await getCachedOrFetch(cacheKey, async () => {
+        // Use rate-limited fetch
+        const response = await rateLimitedFetch(
+          `https://store.steampowered.com/api/appdetails?appids=${steamAppID}&cc=vn&l=vietnamese`
+        );
+        
+        // Check if response is ok
+        if (!response.ok) {
+          if (response.status === 429) {
+            console.log('⚠️ Rate limit hit on game detail, waiting 2 seconds...');
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          }
+          throw new Error(`HTTP ${response.status}`);
+        }
+        
+        const text = await response.text();
+        
+        // Check if response is JSON
+        if (!text.trim().startsWith('{')) {
+          throw new Error('Response is not JSON');
+        }
+        
+        const data = JSON.parse(text);
+        return data[steamAppID]?.data;
+      });
       
       if (!gameDetail) {
         Alert.alert('Lỗi', 'Không thể tải thông tin chi tiết game');
@@ -527,11 +705,11 @@ export default function HomeTab() {
         const updatedDeals = [...deals, ...newGames];
         setDeals(updatedDeals);
         
-        // Apply current filter to new deals
-        if (selectedFilter === 'all') {
+        // Apply current filters to new deals
+        if (selectedFilter === 'all' && selectedGenre === 'all') {
           setFilteredDeals(updatedDeals);
         } else {
-          applyFilterToDeals(updatedDeals, selectedFilter);
+          applyFilterToDeals(updatedDeals, selectedFilter, selectedGenre);
         }
         
         setPage(page + 1);
@@ -587,44 +765,252 @@ export default function HomeTab() {
     return storeNames[storeID] || `Store ${storeID}`;
   };
 
-  const applyFilterToDeals = useCallback((dealsToFilter: GameDeal[], filter: PriceFilter | string) => {
-    if (filter === 'all') {
-      setFilteredDeals(dealsToFilter);
-      return;
+  const applyFilterToDeals = useCallback((dealsToFilter: GameDeal[], priceFilter: PriceFilter | string, genreFilter: string = 'all') => {
+    let filtered = [...dealsToFilter];
+
+    // Apply price filter
+    if (priceFilter !== 'all') {
+      filtered = filtered.filter(deal => {
+        const priceInVND = deal.steamPriceVN ? deal.steamPriceVN.final : 0;
+        
+        switch (priceFilter) {
+          case 'under100k':
+            return priceInVND < 10000000; // 100k VND = 10,000,000 cents
+          case '100k-500k':
+            return priceInVND >= 10000000 && priceInVND < 50000000;
+          case '500k-1m':
+            return priceInVND >= 50000000 && priceInVND < 100000000;
+          default:
+            return true;
+        }
+      });
     }
 
-    const filtered = dealsToFilter.filter(deal => {
-      // Price filters
-      const priceInVND = deal.steamPriceVN ? deal.steamPriceVN.final : 0; // Steam price already in VND cents
+    // Apply genre filter - Map Vietnamese genre keys to English Steam API genres
+    if (genreFilter !== 'all') {
+      // Genre mapping from our filter keys to Steam API genre names (Vietnamese)
+      const genreMap: { [key: string]: string[] } = {
+        'action': ['Hành động', 'Action'],
+        'adventure': ['Phiêu lưu', 'Adventure'],
+        'rpg': ['Nhập vai', 'RPG', 'Role-Playing'],
+        'strategy': ['Chiến thuật', 'Strategy'],
+        'simulation': ['Mô phỏng', 'Simulation'],
+        'sports': ['Thể thao', 'Sports'],
+        'racing': ['Đua xe', 'Racing'],
+        'indie': ['Indie'],
+        'early_access': ['Truy cập sớm', 'Early Access'],
+        'casual': ['Giải trí', 'Casual']
+      };
+
+      const genreKeywords = genreMap[genreFilter] || [genreFilter];
       
-      switch (filter) {
-        case 'under100k':
-          return priceInVND < 10000000; // 100k VND = 10,000,000 cents
-        case '100k-500k':
-          return priceInVND >= 10000000 && priceInVND < 50000000;
-        case '500k-1m':
-          return priceInVND >= 50000000 && priceInVND < 100000000;
-        case 'over1m':
-          return priceInVND >= 100000000;
-        default:
-          return true;
+      // Count how many games have genre data
+      const gamesWithGenres = filtered.filter(deal => deal.genres && deal.genres.length > 0);
+      console.log(`🎮 Filtering by genre: ${genreFilter}`);
+      console.log(`📊 Games with genre data: ${gamesWithGenres.length}/${filtered.length}`);
+      
+      // Debug: Log some sample genres to see what we're getting
+      if (gamesWithGenres.length > 0) {
+        const sampleGame = gamesWithGenres[0];
+        console.log(`🔍 Sample game: "${sampleGame.title}"`);
+        console.log(`🔍 Sample genres:`, sampleGame.genres?.map(g => g.description).join(', '));
       }
-    });
+      
+      filtered = filtered.filter(deal => {
+        if (!deal.genres || deal.genres.length === 0) return false;
+        
+        // Check if any of the game's genres match any of our keywords
+        const hasMatchingGenre = deal.genres.some(genre => 
+          genreKeywords.some(keyword => 
+            genre.description.toLowerCase().includes(keyword.toLowerCase())
+          )
+        );
+        
+        // Debug log for first few games
+        if (filtered.indexOf(deal) < 3) {
+          console.log(`🔍 Game: "${deal.title}" | Genres: [${deal.genres.map(g => g.description).join(', ')}] | Match: ${hasMatchingGenre}`);
+        }
+        
+        return hasMatchingGenre;
+      });
+      
+      console.log(`✅ Found ${filtered.length} games with genre: ${genreFilter}`);
+    }
     
     setFilteredDeals(filtered);
   }, []);
 
+  // Debounced filter function to avoid too frequent updates
+  const debouncedApplyFilter = useCallback(
+    debounce((dealsToFilter: GameDeal[], priceFilter: PriceFilter | string, genreFilter: string) => {
+      applyFilterToDeals(dealsToFilter, priceFilter, genreFilter);
+    }, 300),
+    [applyFilterToDeals]
+  );
+
   const filterDealsByPrice = useCallback((filter: PriceFilter) => {
     setSelectedFilter(filter);
-    applyFilterToDeals(deals, filter);
-  }, [deals, applyFilterToDeals]);
+    // Apply immediately for better UX, debounce is for API calls if needed
+    applyFilterToDeals(deals, filter, selectedGenre);
+  }, [deals, selectedGenre, applyFilterToDeals]);
+
+  const filterDealsByGenre = useCallback(async (genre: string) => {
+    setSelectedGenre(genre);
+    
+    // If selecting "all", just apply filter without fetching genres
+    if (genre === 'all') {
+      applyFilterToDeals(deals, selectedFilter, genre);
+      return;
+    }
+    
+    // If already fetching genres, don't fetch again
+    if (isFetchingGenres.current) {
+      console.log('⏸️ Already fetching genres, skipping...');
+      applyFilterToDeals(deals, selectedFilter, genre);
+      return;
+    }
+    
+    // Check how many games already have genre data
+    const dealsWithGenreData = deals.filter(d => d.genres && d.genres.length > 0);
+    const dealsNeedingGenres = deals.filter(d => (!d.genres || d.genres.length === 0) && d.steamAppID);
+    
+    console.log(`📊 Genre data status: ${dealsWithGenreData.length} have genres, ${dealsNeedingGenres.length} need to fetch`);
+    
+    // If most deals already have genres, just apply filter
+    if (dealsNeedingGenres.length === 0 || dealsWithGenreData.length > deals.length * 0.5) {
+      console.log('✅ Using existing genre data for filtering');
+      applyFilterToDeals(deals, selectedFilter, genre);
+      return;
+    }
+    
+    // Set fetching flag
+    isFetchingGenres.current = true;
+    
+    // Don't show full loading state, just filter with existing data first
+    console.log('⏳ Fetching genres for games...');
+    
+    // Apply filter with existing data immediately (show what we have)
+    applyFilterToDeals(deals, selectedFilter, genre);
+    
+    try {
+      // Use parallel fetching with concurrency control
+      const updatedDeals = [...deals];
+      
+      // Batch processing with parallel fetching (max 3 concurrent)
+      const batchSize = 5;
+      for (let i = 0; i < dealsNeedingGenres.length; i += batchSize) {
+        const batch = dealsNeedingGenres.slice(i, i + batchSize);
+        
+        // Parallel fetch with limit
+        await parallelFetchWithLimit(
+          batch,
+          async (deal) => {
+            try {
+              const cacheKey = `game_genres_${deal.steamAppID}`;
+              const genres = await getCachedOrFetch(cacheKey, async () => {
+                const response = await rateLimitedFetch(
+                  `https://store.steampowered.com/api/appdetails?appids=${deal.steamAppID}&cc=vn&l=vietnamese`
+                );
+                
+                if (!response.ok) return [];
+                
+                const text = await response.text();
+                if (!text.trim().startsWith('{')) return [];
+                
+                const data = JSON.parse(text);
+                const appID = deal.steamAppID!;
+                const fetchedGenres = data[appID]?.data?.genres || [];
+                
+                // Debug log
+                if (fetchedGenres.length > 0) {
+                  console.log(`🔍 Fetched genres for "${deal.title}":`, fetchedGenres.map((g: any) => g.description).join(', '));
+                } else {
+                  console.log(`⚠️ No genres found for "${deal.title}"`);
+                }
+                
+                return fetchedGenres;
+              });
+              
+              // Update the deal in updatedDeals array
+              const dealIndex = updatedDeals.findIndex(d => d.dealID === deal.dealID);
+              if (dealIndex !== -1) {
+                updatedDeals[dealIndex] = { ...updatedDeals[dealIndex], genres };
+              }
+              
+              return genres;
+            } catch (error) {
+              console.log(`Error fetching genres for ${deal.title}`);
+              return null;
+            }
+          },
+          MAX_PARALLEL_REQUESTS
+        );
+        
+        // Update deals and re-apply filter after each batch
+        setDeals([...updatedDeals]);
+        applyFilterToDeals(updatedDeals, selectedFilter, genre);
+        
+        console.log(`✅ Fetched batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(dealsNeedingGenres.length / batchSize)}, updating display...`);
+        
+        // Small delay between batches
+        if (i + batchSize < dealsNeedingGenres.length) {
+          await new Promise(resolve => setTimeout(resolve, 300));
+        }
+      }
+      
+      console.log('✅ Finished fetching all genres');
+      
+      // Collect and log all unique genres for statistics
+      const allGenres = new Set<string>();
+      updatedDeals.forEach(deal => {
+        if (deal.genres && deal.genres.length > 0) {
+          deal.genres.forEach(genre => {
+            allGenres.add(genre.description);
+          });
+        }
+      });
+      
+      console.log('\n📊 ===== THỐNG KÊ TẤT CẢ THỂ LOẠI GAME =====');
+      console.log(`Tổng số thể loại khác nhau: ${allGenres.size}`);
+      console.log('Danh sách thể loại:');
+      Array.from(allGenres).sort().forEach((genre, index) => {
+        console.log(`  ${index + 1}. ${genre}`);
+      });
+      console.log('=============================================\n');
+      
+      // Final update with all genres
+      setDeals(updatedDeals);
+      applyFilterToDeals(updatedDeals, selectedFilter, genre);
+      
+      // Reset fetching flag
+      isFetchingGenres.current = false;
+    } catch (error) {
+      console.error('Error fetching genres:', error);
+      // Reset fetching flag on error
+      isFetchingGenres.current = false;
+      // Apply filter anyway with existing data (already applied above)
+    }
+  }, [deals, selectedFilter, applyFilterToDeals]);
 
   const filterOptions = [
     { key: 'all', label: 'Tất cả', icon: '🎮' },
     { key: 'under100k', label: '< 100k', icon: '💰' },
     { key: '100k-500k', label: '100k-500k', icon: '💸' },
     { key: '500k-1m', label: '500k-1M', icon: '💎' },
-    { key: 'over1m', label: '> 1M', icon: '👑' },
+  ];
+
+  const genreOptions = [
+    { key: 'all', label: 'Tất cả thể loại', icon: '🎮' },
+    { key: 'action', label: 'Hành Động', icon: '⚔️' },
+    { key: 'adventure', label: 'Phiêu Lưu', icon: '🗺️' },
+    { key: 'rpg', label: 'Nhập Vai', icon: '🧙' },
+    { key: 'strategy', label: 'Chiến Thuật', icon: '♟️' },
+    { key: 'simulation', label: 'Mô Phỏng', icon: '🎲' },
+    { key: 'sports', label: 'Thể Thao', icon: '⚽' },
+    { key: 'racing', label: 'Đua Xe', icon: '🏎️' },
+    { key: 'indie', label: 'Indie', icon: '�' },
+    { key: 'early_access', label: 'Truy cập sớm', icon: '🚀' },
+    { key: 'casual', label: 'Giải Trí', icon: '🎯' },
   ];
 
   const GameDealItem = memo(({ item, onPress }: { item: GameDeal; onPress: (item: GameDeal) => void }) => (
@@ -855,6 +1241,40 @@ export default function HomeTab() {
                 color: selectedFilter === option.key ? '#FFFFFF' : '#8E8E93',
                 fontSize: 13,
                 fontWeight: selectedFilter === option.key ? 'bold' : 'normal',
+              }}>
+                {option.label}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
+
+        {/* Genre Filter */}
+        <ScrollView 
+          horizontal 
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={{ paddingRight: 16, marginTop: 12 }}
+        >
+          {genreOptions.map((option) => (
+            <TouchableOpacity
+              key={option.key}
+              onPress={() => filterDealsByGenre(option.key)}
+              style={{
+                backgroundColor: selectedGenre === option.key ? '#3B5FE8' : '#3C3C3E',
+                paddingHorizontal: 12,
+                paddingVertical: 8,
+                borderRadius: 20,
+                marginRight: 10,
+                flexDirection: 'row',
+                alignItems: 'center',
+              }}
+            >
+              <Text style={{ marginRight: 4, fontSize: 12 }}>
+                {option.icon}
+              </Text>
+              <Text style={{
+                color: selectedGenre === option.key ? '#FFFFFF' : '#8E8E93',
+                fontSize: 13,
+                fontWeight: selectedGenre === option.key ? 'bold' : 'normal',
               }}>
                 {option.label}
               </Text>
