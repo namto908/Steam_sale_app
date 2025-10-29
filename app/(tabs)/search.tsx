@@ -168,7 +168,21 @@ export default function SearchTab() {
   const fetchGameDetail = async (steamAppID: string): Promise<GameDetail | null> => {
     try {
       const response = await fetch(`https://store.steampowered.com/api/appdetails?appids=${steamAppID}&cc=vn&l=vietnamese`);
-      const data = await response.json();
+      
+      if (!response.ok) {
+        console.error(`Steam API error: ${response.status}`);
+        return null;
+      }
+      
+      const text = await response.text();
+      
+      // Check if response is JSON
+      if (!text.trim().startsWith('{')) {
+        console.error('Steam API returned non-JSON response');
+        return null;
+      }
+      
+      const data = JSON.parse(text);
       return data[steamAppID]?.data || null;
     } catch (error) {
       console.error('Error fetching game detail:', error);
@@ -185,7 +199,21 @@ export default function SearchTab() {
       const gameResponse = await fetch(
         `https://store.steampowered.com/api/appdetails?appids=${steamAppID}&cc=vn&l=vietnamese`
       );
-      const gameData = await gameResponse.json();
+      
+      if (!gameResponse.ok) {
+        console.log(`Steam API error: ${gameResponse.status}`);
+        return [];
+      }
+      
+      const gameText = await gameResponse.text();
+      
+      // Check if response is JSON
+      if (!gameText.trim().startsWith('{')) {
+        console.log('Steam API returned non-JSON response');
+        return [];
+      }
+      
+      const gameData = JSON.parse(gameText);
       const gameInfo = gameData[steamAppID]?.data;
       
       if (!gameInfo || !gameInfo.dlc || gameInfo.dlc.length === 0) {
@@ -193,7 +221,7 @@ export default function SearchTab() {
         return [];
       }
       
-      console.log(`� Found ${gameInfo.dlc.length} DLC AppIDs in Steam data`);
+      console.log(`📦 Found ${gameInfo.dlc.length} DLC AppIDs in Steam data`);
       
       // Step 2: Get details for each DLC from Steam API
       const dlcDetails = await Promise.all(
@@ -202,7 +230,18 @@ export default function SearchTab() {
             const dlcResponse = await fetch(
               `https://store.steampowered.com/api/appdetails?appids=${dlcAppId}&cc=vn&l=vietnamese`
             );
-            const dlcData = await dlcResponse.json();
+            
+            if (!dlcResponse.ok) {
+              return null;
+            }
+            
+            const dlcText = await dlcResponse.text();
+            
+            if (!dlcText.trim().startsWith('{')) {
+              return null;
+            }
+            
+            const dlcData = JSON.parse(dlcText);
             return dlcData[dlcAppId]?.data;
           } catch (error) {
             console.error(`Error fetching DLC ${dlcAppId}:`, error);

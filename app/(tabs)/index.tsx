@@ -358,24 +358,57 @@ export default function HomeTab() {
     }
   };
 
-  const fetchSteamPrice = async (steamAppID: string) => {
+  const fetchSteamPrice = async (steamAppID: string, retries = 2) => {
     try {
       // Sử dụng Steam Store API để lấy giá chính xác cho region VN
       const response = await fetch(`https://store.steampowered.com/api/appdetails?appids=${steamAppID}&cc=vn&l=vietnamese`);
-      const data = await response.json();
+      
+      // Check if response is ok
+      if (!response.ok) {
+        console.log(`Steam API error for ${steamAppID}: ${response.status}`);
+        return null;
+      }
+      
+      const text = await response.text();
+      
+      // Check if response is JSON
+      if (!text.trim().startsWith('{')) {
+        console.log(`Steam API returned non-JSON for ${steamAppID}`);
+        return null;
+      }
+      
+      const data = JSON.parse(text);
       return data[steamAppID]?.data?.price_overview || null;
     } catch (error) {
-      console.error('Error fetching Steam price:', error);
+      if (retries > 0) {
+        console.log(`Retrying Steam price fetch for ${steamAppID}, retries left: ${retries}`);
+        await new Promise(resolve => setTimeout(resolve, 500)); // Wait 500ms before retry
+        return fetchSteamPrice(steamAppID, retries - 1);
+      }
+      console.error(`Error fetching Steam price for ${steamAppID}:`, error);
       return null;
     }
   };
 
-  const fetchGameDetail = useCallback(async (steamAppID: string) => {
+  const fetchGameDetail = useCallback(async (steamAppID: string, retries = 2) => {
     setLoadingDetail(true);
     try {
       // Lấy thông tin chi tiết từ Steam API
       const response = await fetch(`https://store.steampowered.com/api/appdetails?appids=${steamAppID}&cc=vn&l=vietnamese`);
-      const data = await response.json();
+      
+      // Check if response is ok
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      
+      const text = await response.text();
+      
+      // Check if response is JSON
+      if (!text.trim().startsWith('{')) {
+        throw new Error('Response is not JSON');
+      }
+      
+      const data = JSON.parse(text);
       const gameDetail = data[steamAppID]?.data;
       
       if (!gameDetail) {
@@ -408,8 +441,13 @@ export default function HomeTab() {
       setSelectedGame(formattedData);
       setShowGameDetail(true);
     } catch (error) {
+      if (retries > 0) {
+        console.log(`Retrying game detail fetch for ${steamAppID}, retries left: ${retries}`);
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1s before retry
+        return fetchGameDetail(steamAppID, retries - 1);
+      }
       console.error('Error fetching Steam game detail:', error);
-      Alert.alert('Lỗi', 'Không thể tải thông tin chi tiết game');
+      Alert.alert('Lỗi', 'Steam API tạm thời không khả dụng. Vui lòng thử lại sau.');
     } finally {
       setLoadingDetail(false);
     }
